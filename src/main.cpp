@@ -1,7 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <SPI.h>
 #include <MFRC522.h>
 #include <Wire.h>
@@ -47,10 +48,265 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 // ==========================
 // WIFI / SERVIDOR
 // ==========================
-const char* ssid     = "IFCE";
-const char* password = "ifcewifi";
+const char* ssid     = "LAR-IFCE";
+const char* password = "if.LAR@2024";
 String serverUrl     = "https://ifaccess.iracema.xyz/acesso";
 String matriculaUrl  = "https://ifaccess.iracema.xyz/matricula";
+
+// ==========================
+// SERVIDOR WEB DE DIAGNOSTICO (TIMING)
+// ==========================
+WebServer diagServer(80);
+
+struct TimingRecord {
+  String origem;
+  int rssi;
+  long dnsMs;
+  long tcpTesteMs;
+  long conectarMs;
+  long enviarMs;
+  long respostaMs;
+  long downloadMs;
+  long fecharMs;
+  long totalMs;
+  bool ok;
+};
+
+const int MAX_TIMING_RECORDS = 15;
+TimingRecord timingRecords[MAX_TIMING_RECORDS];
+int timingCount = 0;
+int timingNext  = 0;
+
+void registrarTiming(const TimingRecord &r) {
+  timingRecords[timingNext] = r;
+  timingNext = (timingNext + 1) % MAX_TIMING_RECORDS;
+  if (timingCount < MAX_TIMING_RECORDS) timingCount++;
+}
+
+void handleTimingPage() {
+  String html = "<html><head><meta http-equiv='refresh' content='3'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Diagnostico Catraca</title>";
+  html += "<style>body{font-family:sans-serif}.wrap{overflow-x:auto}table{border-collapse:collapse;min-width:900px}";
+  html += "td,th{border:1px solid #ccc;padding:6px;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}";
+  html += "td:last-child{font-weight:bold}</style></head><body>";
+  html += "<h3>Diagnostico de tempo - Catraca</h3>";
+  html += "<p>IP: " + WiFi.localIP().toString() + " | Uptime: " + String(millis() / 1000) + "s";
+  html += " | WiFi: " + String(WiFi.status() == WL_CONNECTED ? "conectado" : "SEM CONEXAO") + "</p>";
+  html += "<p style='font-size:12px;color:#666'>DNS: resolver nome->IP | TCP teste: conexao TCP crua descartavel (mede so a rede) | "
+          "Conectar: TCP+TLS reais usados na requisicao | Enviar: escrever o POST no socket | "
+          "Resposta servidor: tempo ate o 1o byte chegar (TTFB, indica o servidor pensando) | Download: baixar o corpo | Fechar: encerrar conexao</p>";
+  html += "<div class='wrap'><table><tr><th>Origem</th><th>RSSI</th><th>DNS</th><th>TCP teste</th><th>Conectar(TCP+TLS)</th>"
+          "<th>Enviar</th><th>Resposta servidor</th><th>Download</th><th>Fechar</th><th>TOTAL</th></tr>";
+
+  for (int i = 0; i < timingCount; i++) {
+    int idx = (timingNext - 1 - i + MAX_TIMING_RECORDS) % MAX_TIMING_RECORDS;
+    TimingRecord &r = timingRecords[idx];
+    html += "<tr><td>" + r.origem + (r.ok ? "" : " (falhou)") + "</td><td>" + String(r.rssi) + "dBm</td>";
+    html += "<td>" + String(r.dnsMs) + "ms</td><td>" + String(r.tcpTesteMs) + "ms</td><td>" + String(r.conectarMs) + "ms</td>";
+    html += "<td>" + String(r.enviarMs) + "ms</td><td>" + String(r.respostaMs) + "ms</td><td>" + String(r.downloadMs) + "ms</td>";
+    html += "<td>" + String(r.fecharMs) + "ms</td><td>" + String(r.totalMs) + "ms</td></tr>";
+  }
+
+  if (timingCount == 0) html += "<tr><td colspan='10'>Nenhuma leitura ainda</td></tr>";
+  html += "</table></div></body></html>";
+
+  diagServer.send(200, "text/html", html);
+}
+
+// ==========================
+// REQUISICAO HTTPS MANUAL COM TIMING DETALHADO
+// ==========================
+void parseUrl(String url, String &host, String &path) {
+  int hostStart = url.indexOf("://");
+  hostStart = (hostStart < 0) ? 0 : hostStart + 3;
+  int pathStart = url.indexOf('/', hostStart);
+  if (pathStart < 0) {
+    host = url.substring(hostStart);
+    path = "/";
+  } else {
+    host = url.substring(hostStart, pathStart);
+    path = url.substring(pathStart);
+  }
+}
+
+// ==========================
+// CLIENTE HTTPS REUTILIZADO
+// (mantido conectado entre requisicoes para evitar
+//  refazer o handshake TLS a cada leitura de cartao)
+// ==========================
+WiFiClientSecure secureClient;
+String secureClientHost = "";
+bool secureClientPronto = false;
+const unsigned long HTTP_TIMEOUT_MS = 3000;
+
+int extrairContentLength(const String &headers) {
+  int idx = headers.indexOf("Content-Length:");
+  if (idx < 0) idx = headers.indexOf("content-length:");
+  if (idx < 0) return -1;
+  int lineEnd = headers.indexOf("\r\n", idx);
+  String valor = headers.substring(idx + String("Content-Length:").length(), lineEnd);
+  valor.trim();
+  return valor.toInt();
+}
+
+bool respostaFechaConexao(String headers) {
+  headers.toLowerCase();
+  return headers.indexOf("connection: close") >= 0;
+}
+
+int fazerRequisicaoComTiming(String url, String jsonBody, String origem, String &respostaOut) {
+  String host, path;
+  parseUrl(url, host, path);
+
+  TimingRecord r;
+  r.origem = origem;
+  r.rssi   = WiFi.RSSI();
+  r.ok     = false;
+
+  unsigned long t0 = millis();
+
+  IPAddress ip;
+  unsigned long tA = millis();
+  bool dnsOk = WiFi.hostByName(host.c_str(), ip);
+  r.dnsMs = millis() - tA;
+
+  unsigned long tC = millis();
+  {
+    WiFiClient rawClient;
+    if (dnsOk) rawClient.connect(ip, 443);
+    else       rawClient.connect(host.c_str(), 443);
+    rawClient.stop();
+  }
+  r.tcpTesteMs = millis() - tC;
+
+  if (!secureClientPronto) {
+    secureClient.setInsecure();
+    secureClient.setTimeout(HTTP_TIMEOUT_MS / 1000);
+    secureClient.setHandshakeTimeout(HTTP_TIMEOUT_MS);
+    secureClientPronto = true;
+  }
+
+  unsigned long tE = millis();
+  bool reaproveitada = secureClient.connected() && secureClientHost == host;
+  bool connected = reaproveitada;
+  if (!connected) {
+    secureClient.stop();
+    connected = dnsOk ? secureClient.connect(ip, 443, HTTP_TIMEOUT_MS) : secureClient.connect(host.c_str(), 443, HTTP_TIMEOUT_MS);
+    if (connected) secureClientHost = host;
+  }
+  r.conectarMs = millis() - tE;
+
+  if (!connected) {
+    r.enviarMs = r.respostaMs = r.downloadMs = r.fecharMs = 0;
+    r.totalMs  = millis() - t0;
+    registrarTiming(r);
+    respostaOut = "";
+    secureClientHost = "";
+    return -1;
+  }
+
+  String request = "POST " + path + " HTTP/1.1\r\n";
+  request += "Host: " + host + "\r\n";
+  request += "Content-Type: application/json\r\n";
+  request += "Content-Length: " + String(jsonBody.length()) + "\r\n";
+  request += "Connection: keep-alive\r\n\r\n";
+  request += jsonBody;
+
+  unsigned long tG = millis();
+  size_t escritos = secureClient.print(request);
+  r.enviarMs = millis() - tG;
+
+  if (escritos == 0 && reaproveitada) {
+    // conexao reaproveitada estava morta do lado do servidor — reconecta e tenta 1x
+    secureClient.stop();
+    connected = dnsOk ? secureClient.connect(ip, 443) : secureClient.connect(host.c_str(), 443);
+    if (connected) {
+      secureClientHost = host;
+      tG = millis();
+      escritos = secureClient.print(request);
+      r.enviarMs = millis() - tG;
+    }
+  }
+
+  if (!connected || escritos == 0) {
+    r.respostaMs = r.downloadMs = r.fecharMs = 0;
+    r.totalMs = millis() - t0;
+    registrarTiming(r);
+    respostaOut = "";
+    secureClient.stop();
+    secureClientHost = "";
+    return -1;
+  }
+
+  unsigned long tI = millis();
+  unsigned long limite = tI + HTTP_TIMEOUT_MS;
+  while (!secureClient.available() && secureClient.connected() && millis() < limite) {
+    delay(1);
+  }
+  r.respostaMs = millis() - tI;
+
+  unsigned long tK = millis();
+
+  String headers = "";
+  bool headersCompletos = false;
+  unsigned long limiteHeaders = millis() + HTTP_TIMEOUT_MS;
+  while (!headersCompletos && millis() < limiteHeaders) {
+    while (secureClient.available()) {
+      headers += (char)secureClient.read();
+      if (headers.endsWith("\r\n\r\n")) { headersCompletos = true; break; }
+    }
+    if (!headersCompletos && !secureClient.connected() && !secureClient.available()) break;
+  }
+
+  int contentLength = extrairContentLength(headers);
+  bool chunked = headers.indexOf("Transfer-Encoding: chunked") >= 0 ||
+                 headers.indexOf("transfer-encoding: chunked") >= 0;
+  bool fechaConexao = respostaFechaConexao(headers) || chunked || contentLength < 0;
+
+  String corpo = "";
+  if (!fechaConexao) {
+    unsigned long limiteBody = millis() + HTTP_TIMEOUT_MS;
+    while ((int)corpo.length() < contentLength && millis() < limiteBody) {
+      while (secureClient.available() && (int)corpo.length() < contentLength) {
+        corpo += (char)secureClient.read();
+      }
+      if (!secureClient.connected() && !secureClient.available() && (int)corpo.length() < contentLength) break;
+    }
+  } else {
+    unsigned long limiteFechamento = millis() + HTTP_TIMEOUT_MS;
+    while ((secureClient.connected() || secureClient.available()) && millis() < limiteFechamento) {
+      while (secureClient.available()) corpo += (char)secureClient.read();
+      if (!secureClient.connected() && !secureClient.available()) break;
+    }
+    if (millis() >= limiteFechamento) {
+      secureClient.stop();
+      secureClientHost = "";
+    }
+  }
+  r.downloadMs = millis() - tK;
+
+  unsigned long tM = millis();
+  if (fechaConexao) {
+    secureClient.stop();
+    secureClientHost = "";
+  }
+  r.fecharMs = millis() - tM;
+
+  r.totalMs = millis() - t0;
+  r.ok = true;
+  registrarTiming(r);
+
+  int code = 0;
+  int sp1 = headers.indexOf(' ');
+  if (headers.startsWith("HTTP/") && sp1 > 0) {
+    int sp2 = headers.indexOf(' ', sp1 + 1);
+    code = headers.substring(sp1 + 1, sp2).toInt();
+  }
+
+  respostaOut = corpo;
+  return code;
+}
 
 // ==========================
 // ESTADO DA CATRACA
@@ -184,6 +440,20 @@ void setup() {
     delay(1500);
   }
 
+  if (WiFi.status() == WL_CONNECTED) {
+    diagServer.on("/", handleTimingPage);
+    diagServer.on("/timing", handleTimingPage);
+    diagServer.begin();
+
+    if (MDNS.begin("catraca")) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.println("Diagnostico web em: http://catraca.local");
+    } else {
+      Serial.println("Falha ao iniciar mDNS");
+    }
+    Serial.println("Diagnostico web tambem em: http://" + WiFi.localIP().toString());
+  }
+
   lcdIdle();
   noTone(BUZZER_PIN);
   Serial.println("Sistema iniciado");
@@ -195,9 +465,10 @@ void setup() {
 void loop() {
 
   // ─────────────────────────────────────────────────
-  // 0. BUZZER
+  // 0. BUZZER + SERVIDOR DE DIAGNOSTICO
   // ─────────────────────────────────────────────────
   processarBeep();
+  diagServer.handleClient();
 
   // ─────────────────────────────────────────────────
   // 1. WIFI — reconecta se necessário
@@ -269,7 +540,9 @@ void loop() {
       lastUID = uid;
       Serial.println("Cartão UID: " + uid);
       mostrarLCD("Lendo cartao...", uid);
+      unsigned long tLoopStart = millis();
       enviarUID(uid);
+      Serial.printf("[TIMING LOOP] leitura->fim_enviarUID = %lums\n", millis() - tLoopStart);
       matriculaBuffer = "";
       aguardandoMatricula = false;
     }
@@ -348,16 +621,9 @@ void enviarUID(String uid) {
     return;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, serverUrl);
-  http.addHeader("Content-Type", "application/json");
-
   String body = "{\"uid\":\"" + uid + "\"}";
-  int code = http.POST(body);
-  String resp = (code > 0) ? http.getString() : "";
-  http.end();
+  String resp;
+  int code = fazerRequisicaoComTiming(serverUrl, body, "RFID:" + uid, resp);
 
   Serial.println("Resp RFID: " + resp);
   processarResposta(code, resp);
@@ -374,16 +640,9 @@ void enviarMatricula(String matricula) {
     return;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, matriculaUrl);
-  http.addHeader("Content-Type", "application/json");
-
   String body = "{\"matricula\":\"" + matricula + "\"}";
-  int code = http.POST(body);
-  String resp = (code > 0) ? http.getString() : "";
-  http.end();
+  String resp;
+  int code = fazerRequisicaoComTiming(matriculaUrl, body, "MAT:" + matricula, resp);
 
   Serial.println("Resp Matricula: " + resp);
   processarResposta(code, resp);
