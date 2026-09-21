@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <SPI.h>
 #include <MFRC522.h>
@@ -47,10 +46,203 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 // ==========================
 // WIFI / SERVIDOR
 // ==========================
-const char* ssid     = "IFCE";
-const char* password = "ifcewifi";
+const char* ssid     = "Kauan ";
+const char* password = "K240260n";
 String serverUrl     = "https://ifaccess.iracema.xyz/acesso";
 String matriculaUrl  = "https://ifaccess.iracema.xyz/matricula";
+
+// ==========================
+// REQUISICAO HTTPS MANUAL
+// ==========================
+void parseUrl(String url, String &host, String &path) {
+  int hostStart = url.indexOf("://");
+  hostStart = (hostStart < 0) ? 0 : hostStart + 3;
+  int pathStart = url.indexOf('/', hostStart);
+  if (pathStart < 0) {
+    host = url.substring(hostStart);
+    path = "/";
+  } else {
+    host = url.substring(hostStart, pathStart);
+    path = url.substring(pathStart);
+  }
+}
+
+// ==========================
+// CLIENTE HTTPS REUTILIZADO
+// (mantido conectado entre requisicoes para evitar
+//  refazer o handshake TLS a cada leitura de cartao)
+// ==========================
+WiFiClientSecure secureClient;
+String secureClientHost = "";
+bool secureClientPronto = false;
+unsigned long secureClientLastUse = 0;
+const unsigned long HTTP_TIMEOUT_MS = 3000;
+const unsigned long MAX_REUSE_IDLE_MS = 4000;   // acima disso, proxy do servidor provavelmente ja fechou
+const unsigned long STALE_WAIT_MS     = 1200;   // espera curta ao reaproveitar; se nao responder, refaz do zero
+
+int extrairContentLength(const String &headers) {
+  int idx = headers.indexOf("Content-Length:");
+  if (idx < 0) idx = headers.indexOf("content-length:");
+  if (idx < 0) return -1;
+  int lineEnd = headers.indexOf("\r\n", idx);
+  String valor = headers.substring(idx + String("Content-Length:").length(), lineEnd);
+  valor.trim();
+  return valor.toInt();
+}
+
+bool respostaFechaConexao(String headers) {
+  headers.toLowerCase();
+  return headers.indexOf("connection: close") >= 0;
+}
+
+int fazerRequisicao(String url, String jsonBody, String &respostaOut) {
+  String host, path;
+  parseUrl(url, host, path);
+
+  IPAddress ip;
+  bool dnsOk = WiFi.hostByName(host.c_str(), ip);
+
+  if (!secureClientPronto) {
+    secureClient.setInsecure();
+    secureClient.setTimeout(HTTP_TIMEOUT_MS / 1000);
+    secureClient.setHandshakeTimeout(HTTP_TIMEOUT_MS);
+    secureClientPronto = true;
+  }
+
+  bool reaproveitada = secureClient.connected() && secureClientHost == host &&
+                        (millis() - secureClientLastUse < MAX_REUSE_IDLE_MS);
+  bool connected = reaproveitada;
+  if (!connected) {
+    secureClient.stop();
+    connected = dnsOk ? secureClient.connect(ip, 443, HTTP_TIMEOUT_MS) : secureClient.connect(host.c_str(), 443, HTTP_TIMEOUT_MS);
+    if (connected) secureClientHost = host;
+  }
+
+  if (!connected) {
+    secureClientHost = "";
+    respostaOut = "";
+    return -1;
+  }
+
+  String request = "POST " + path + " HTTP/1.1\r\n";
+  request += "Host: " + host + "\r\n";
+  request += "Content-Type: application/json\r\n";
+  request += "Content-Length: " + String(jsonBody.length()) + "\r\n";
+  request += "Connection: keep-alive\r\n\r\n";
+  request += jsonBody;
+
+  size_t escritos = secureClient.print(request);
+
+  if (escritos == 0 && reaproveitada) {
+    // conexao reaproveitada estava morta do lado do servidor — reconecta e tenta 1x
+    secureClient.stop();
+    connected = dnsOk ? secureClient.connect(ip, 443) : secureClient.connect(host.c_str(), 443);
+    if (connected) {
+      secureClientHost = host;
+      escritos = secureClient.print(request);
+    }
+  }
+
+  if (!connected || escritos == 0) {
+    secureClient.stop();
+    secureClientHost = "";
+    respostaOut = "";
+    return -1;
+  }
+
+  unsigned long esperaResposta = reaproveitada ? STALE_WAIT_MS : HTTP_TIMEOUT_MS;
+  unsigned long limite = millis() + esperaResposta;
+  while (!secureClient.available() && secureClient.connected() && millis() < limite) {
+    delay(1);
+  }
+
+  if (reaproveitada && !secureClient.available()) {
+    // conexao reaproveitada nao respondeu a tempo (provavelmente fechada em silencio
+    // pelo proxy do servidor) — descarta e refaz com conexao nova, 1x
+    secureClient.stop();
+    connected = dnsOk ? secureClient.connect(ip, 443, HTTP_TIMEOUT_MS) : secureClient.connect(host.c_str(), 443, HTTP_TIMEOUT_MS);
+    if (connected) {
+      secureClientHost = host;
+      escritos = secureClient.print(request);
+
+      unsigned long limite2 = millis() + HTTP_TIMEOUT_MS;
+      while (!secureClient.available() && secureClient.connected() && millis() < limite2) {
+        delay(1);
+      }
+    }
+
+    if (!connected || escritos == 0) {
+      secureClient.stop();
+      secureClientHost = "";
+      respostaOut = "";
+      return -1;
+    }
+  }
+
+  String headers = "";
+  bool headersCompletos = false;
+  unsigned long limiteHeaders = millis() + HTTP_TIMEOUT_MS;
+  while (!headersCompletos && millis() < limiteHeaders) {
+    while (secureClient.available()) {
+      headers += (char)secureClient.read();
+      if (headers.endsWith("\r\n\r\n")) { headersCompletos = true; break; }
+    }
+    if (!headersCompletos && !secureClient.connected() && !secureClient.available()) break;
+  }
+
+  int contentLength = extrairContentLength(headers);
+  bool chunked = headers.indexOf("Transfer-Encoding: chunked") >= 0 ||
+                 headers.indexOf("transfer-encoding: chunked") >= 0;
+  bool fechaConexao = respostaFechaConexao(headers) || chunked || contentLength < 0;
+
+  String corpo = "";
+  if (!fechaConexao) {
+    unsigned long limiteBody = millis() + HTTP_TIMEOUT_MS;
+    while ((int)corpo.length() < contentLength && millis() < limiteBody) {
+      while (secureClient.available() && (int)corpo.length() < contentLength) {
+        corpo += (char)secureClient.read();
+      }
+      if (!secureClient.connected() && !secureClient.available() && (int)corpo.length() < contentLength) break;
+    }
+  } else {
+    unsigned long limiteFechamento = millis() + HTTP_TIMEOUT_MS;
+    while ((secureClient.connected() || secureClient.available()) && millis() < limiteFechamento) {
+      while (secureClient.available()) corpo += (char)secureClient.read();
+      if (!secureClient.connected() && !secureClient.available()) break;
+    }
+    if (millis() >= limiteFechamento) {
+      secureClient.stop();
+      secureClientHost = "";
+    }
+  }
+
+  if (fechaConexao) {
+    secureClient.stop();
+    secureClientHost = "";
+  }
+
+  if (secureClient.connected()) secureClientLastUse = millis();
+
+  int code = 0;
+  int sp1 = headers.indexOf(' ');
+  if (headers.startsWith("HTTP/") && sp1 > 0) {
+    int sp2 = headers.indexOf(' ', sp1 + 1);
+    code = headers.substring(sp1 + 1, sp2).toInt();
+  }
+
+  respostaOut = corpo;
+  return code;
+}
+
+// tenta 1x, e se falhar/der timeout, tenta mais 1x antes de desistir
+int fazerRequisicaoComRetry(String url, String jsonBody, String &respostaOut) {
+  int code = fazerRequisicao(url, jsonBody, respostaOut);
+  if (code <= 0) {
+    Serial.println("Falha na comunicacao — tentando novamente...");
+    code = fazerRequisicao(url, jsonBody, respostaOut);
+  }
+  return code;
+}
 
 // ==========================
 // ESTADO DA CATRACA
@@ -62,6 +254,7 @@ unsigned long lastCardRead  = 0;
 const unsigned long releaseTime  = 5000;
 const unsigned long cardCooldown = 3000;
 bool creditoRotacao = false;
+bool modoLivre = false; // catraca sempre liberada — usar se a internet do IF cair
 String lastUID = "";
 
 // ==========================
@@ -69,6 +262,17 @@ String lastUID = "";
 // ==========================
 String matriculaBuffer = "";
 bool aguardandoMatricula = false;
+
+// ==========================
+// MENU ADMIN (TECLA D = F4)
+// ==========================
+const String SENHA_ADMIN = "9635"; // PIN numerico de 4 digitos para entrar no menu admin
+
+enum ModoAdmin { ADMIN_OFF, ADMIN_SENHA, ADMIN_MENU };
+ModoAdmin modoAdmin = ADMIN_OFF;
+String adminBuffer = "";
+
+unsigned long wifiCaiuEm = 0;
 
 // ==========================
 // TIMER LCD
@@ -130,6 +334,18 @@ void    somLiberado();
 void    somNegado();
 void    somLeitura();
 String  extrairCampo(String json, String campo);
+void    forcarReconexaoWiFi();
+
+void forcarReconexaoWiFi() {
+  mostrarLCD("Reconectando", "WiFi, aguarde...");
+  Serial.println("Reconexao forcada pelo teclado");
+  WiFi.disconnect();
+  delay(100);
+  WiFi.begin(ssid, password);
+  wifiCaiuEm = millis();
+  somLeitura();
+  agendarLcdIdle();
+}
 
 // =====================================================
 // SETUP
@@ -164,6 +380,8 @@ void setup() {
 
   mostrarLCD("Conectando", "WiFi...");
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);       // catraca fica na tomada — sem economia de energia, evita picos de latencia no radio
+  WiFi.setAutoReconnect(true); // deixa o proprio driver do ESP32 reconectar assim que detecta a queda
   WiFi.disconnect();
   delay(100);
   WiFi.begin(ssid, password);
@@ -200,15 +418,27 @@ void loop() {
   processarBeep();
 
   // ─────────────────────────────────────────────────
-  // 1. WIFI — reconecta se necessário
+  // 1. WIFI — reconexao ativa (nao depende so do
+  //    auto-reconnect do driver, que as vezes nao volta)
   // ─────────────────────────────────────────────────
-  static unsigned long lastWifiCheck = 0;
-  if (millis() - lastWifiCheck > 5000) {
-    lastWifiCheck = millis();
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi perdido — reconectando...");
-      WiFi.reconnect();
+  static unsigned long lastWifiTry = 0;
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiCaiuEm == 0) wifiCaiuEm = millis();
+    if (millis() - lastWifiTry > 2000) {
+      lastWifiTry = millis();
+      unsigned long caidoHa = millis() - wifiCaiuEm;
+      if (caidoHa < 8000) {
+        Serial.println("WiFi perdido — reconectando...");
+        WiFi.reconnect();
+      } else {
+        Serial.println("WiFi ainda caido — reconexao completa...");
+        WiFi.disconnect();
+        WiFi.begin(ssid, password);
+        wifiCaiuEm = millis(); // reinicia o ciclo: mais algumas tentativas leves antes do proximo begin()
+      }
     }
+  } else {
+    wifiCaiuEm = 0;
   }
 
   // ─────────────────────────────────────────────────
@@ -226,7 +456,68 @@ void loop() {
   if (key != '\0') {
     Serial.print("Tecla: "); Serial.println(key);
 
-    if (key == '#') {
+    if (modoAdmin == ADMIN_SENHA) {
+      // ---- digitando a senha pra entrar no menu admin ----
+      if (key == '*') {
+        modoAdmin = ADMIN_OFF;
+        adminBuffer = "";
+        lcdIdle();
+      } else if (key >= '0' && key <= '9') {
+        adminBuffer += key;
+        lcd.setCursor(0, 1);
+        String mascara = "";
+        for (uint8_t i = 0; i < adminBuffer.length(); i++) mascara += "*";
+        lcd.print(mascara + "          ");
+
+        if (adminBuffer.length() >= 4) {
+          if (adminBuffer == SENHA_ADMIN) {
+            modoAdmin = ADMIN_MENU;
+            mostrarLCD("A:Reset B:Wifi", "C:Livre   *:Sai");
+            somLeitura();
+          } else {
+            modoAdmin = ADMIN_OFF;
+            mostrarLCD("Senha invalida", "");
+            somNegado();
+            agendarLcdIdle();
+          }
+          adminBuffer = "";
+        }
+      }
+
+    } else if (modoAdmin == ADMIN_MENU) {
+      // ---- menu admin: A reinicia, B forca reconexao WiFi, C alterna acesso livre ----
+      if (key == 'A') {
+        mostrarLCD("Reiniciando...", "");
+        somLeitura();
+        delay(300);
+        ESP.restart();
+      } else if (key == 'B') {
+        modoAdmin = ADMIN_OFF;
+        forcarReconexaoWiFi();
+      } else if (key == 'C') {
+        modoLivre = !modoLivre;
+        modoAdmin = ADMIN_OFF;
+        if (modoLivre) {
+          mostrarLCD("Acesso Livre", "ATIVADO");
+        } else {
+          mostrarLCD("Acesso Livre", "desativado");
+        }
+        somLiberado();
+        agendarLcdIdle();
+      } else if (key == '*') {
+        modoAdmin = ADMIN_OFF;
+        lcdIdle();
+      }
+
+    } else if (key == 'D') {
+      // ---- F4: entra no menu admin, pede senha ----
+      matriculaBuffer = "";
+      aguardandoMatricula = false;
+      modoAdmin = ADMIN_SENHA;
+      adminBuffer = "";
+      mostrarLCD("Senha admin:", "");
+
+    } else if (key == '#') {
       if (matriculaBuffer.length() > 0) {
         mostrarLCD("Consultando...", matriculaBuffer);
         enviarMatricula(matriculaBuffer);
@@ -278,7 +569,7 @@ void loop() {
   // ─────────────────────────────────────────────────
   // 5. CRÉDITO VÁLIDO?
   // ─────────────────────────────────────────────────
-  bool liberado = creditoRotacao && (millis() - lastCardRead < releaseTime);
+  bool liberado = modoLivre || (creditoRotacao && (millis() - lastCardRead < releaseTime));
   if (!liberado) creditoRotacao = false;
 
   // ─────────────────────────────────────────────────
@@ -348,16 +639,9 @@ void enviarUID(String uid) {
     return;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, serverUrl);
-  http.addHeader("Content-Type", "application/json");
-
   String body = "{\"uid\":\"" + uid + "\"}";
-  int code = http.POST(body);
-  String resp = (code > 0) ? http.getString() : "";
-  http.end();
+  String resp;
+  int code = fazerRequisicaoComRetry(serverUrl, body, resp);
 
   Serial.println("Resp RFID: " + resp);
   processarResposta(code, resp);
@@ -374,16 +658,9 @@ void enviarMatricula(String matricula) {
     return;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, matriculaUrl);
-  http.addHeader("Content-Type", "application/json");
-
   String body = "{\"matricula\":\"" + matricula + "\"}";
-  int code = http.POST(body);
-  String resp = (code > 0) ? http.getString() : "";
-  http.end();
+  String resp;
+  int code = fazerRequisicaoComRetry(matriculaUrl, body, resp);
 
   Serial.println("Resp Matricula: " + resp);
   processarResposta(code, resp);
@@ -437,7 +714,11 @@ void processarResposta(int httpCode, String response) {
 // LCD
 // =====================================================
 void lcdIdle() {
-  mostrarLCD("Aproxime cartao", "ou matricula:#");
+  if (modoLivre) {
+    mostrarLCD("Acesso Livre", "catraca liberada");
+  } else {
+    mostrarLCD("Aproxime cartao", "ou matricula:#");
+  }
   lcdPendente = false;
 }
 
