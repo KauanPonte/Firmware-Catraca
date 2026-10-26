@@ -46,8 +46,8 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 // ==========================
 // WIFI / SERVIDOR
 // ==========================
-const char* ssid     = "Kauan ";
-const char* password = "K240260n";
+const char* ssid     = "IFCE-IOT";
+const char* password = "1fiot24c3";
 String serverUrl     = "https://ifaccess.iracema.xyz/acesso";
 String matriculaUrl  = "https://ifaccess.iracema.xyz/matricula";
 
@@ -76,9 +76,19 @@ WiFiClientSecure secureClient;
 String secureClientHost = "";
 bool secureClientPronto = false;
 unsigned long secureClientLastUse = 0;
-const unsigned long HTTP_TIMEOUT_MS = 3000;
-const unsigned long MAX_REUSE_IDLE_MS = 4000;   // acima disso, proxy do servidor provavelmente ja fechou
+IPAddress serverIp;              // DNS em cache: resolver a cada cartao custava tempo a toa
+String serverIpHost = "";
+const unsigned long HTTP_TIMEOUT_MS   = 4000;
+const uint32_t      CONNECT_TIMEOUT_S = 5;      // handshake TLS no ESP32 leva ~1-2s; 3s dava falso timeout
+const unsigned long MAX_REUSE_IDLE_MS = 4000;   // servidor (Node) fecha conexao ociosa com 5s
 const unsigned long STALE_WAIT_MS     = 1200;   // espera curta ao reaproveitar; se nao responder, refaz do zero
+const unsigned long KEEPALIVE_MS      = 3000;   // ping pra manter a conexao TLS aberta e o cartao nao pagar o handshake
+const unsigned long KEEPALIVE_FALHA_MS = 30000; // se o ping falhar, espera mais pra nao travar o loop tentando
+
+// tempo da ultima validacao no LCD (ex: "OK 185ms reap") — false volta ao LCD normal
+const bool MOSTRAR_TEMPO_LCD = false;
+String        ultimaConexao = "";  // reap / nova / morta / falha / 2x
+unsigned long ultimoTempoMs = 0;
 
 int extrairContentLength(const String &headers) {
   int idx = headers.indexOf("Content-Length:");
@@ -95,133 +105,49 @@ bool respostaFechaConexao(String headers) {
   return headers.indexOf("connection: close") >= 0;
 }
 
-int fazerRequisicao(String url, String jsonBody, String &respostaOut) {
-  String host, path;
-  parseUrl(url, host, path);
+void fecharConexao() {
+  secureClient.stop();
+  secureClientHost = "";
+}
 
-  IPAddress ip;
-  bool dnsOk = WiFi.hostByName(host.c_str(), ip);
-
-  if (!secureClientPronto) {
-    secureClient.setInsecure();
-    secureClient.setTimeout(HTTP_TIMEOUT_MS / 1000);
-    secureClient.setHandshakeTimeout(HTTP_TIMEOUT_MS);
-    secureClientPronto = true;
+bool abrirConexao(const String &host) {
+  fecharConexao();
+  if (serverIpHost != host) {
+    if (!WiFi.hostByName(host.c_str(), serverIp)) return false;
+    serverIpHost = host;
   }
-
-  bool reaproveitada = secureClient.connected() && secureClientHost == host &&
-                        (millis() - secureClientLastUse < MAX_REUSE_IDLE_MS);
-  bool connected = reaproveitada;
-  if (!connected) {
-    secureClient.stop();
-    connected = dnsOk ? secureClient.connect(ip, 443, HTTP_TIMEOUT_MS) : secureClient.connect(host.c_str(), 443, HTTP_TIMEOUT_MS);
-    if (connected) secureClientHost = host;
+  // passa o host junto do IP: connect(ip) sozinho manda o IP como SNI no TLS
+  if (!secureClient.connect(serverIp, 443, host.c_str(), NULL, NULL, NULL)) {
+    serverIpHost = ""; // talvez o IP tenha mudado — resolve de novo na proxima
+    return false;
   }
+  secureClientHost = host;
+  return true;
+}
 
-  if (!connected) {
-    secureClientHost = "";
-    respostaOut = "";
-    return -1;
-  }
+// envia a requisicao na conexao ja aberta e le a resposta.
+// retorna -1 se nada chegou dentro de esperaMs (conexao morta)
+int transacao(const String &request, bool semCorpo, unsigned long esperaMs, String &corpo) {
+  corpo = "";
+  if (secureClient.print(request) == 0) { fecharConexao(); return -1; }
 
-  String request = "POST " + path + " HTTP/1.1\r\n";
-  request += "Host: " + host + "\r\n";
-  request += "Content-Type: application/json\r\n";
-  request += "Content-Length: " + String(jsonBody.length()) + "\r\n";
-  request += "Connection: keep-alive\r\n\r\n";
-  request += jsonBody;
-
-  size_t escritos = secureClient.print(request);
-
-  if (escritos == 0 && reaproveitada) {
-    // conexao reaproveitada estava morta do lado do servidor — reconecta e tenta 1x
-    secureClient.stop();
-    connected = dnsOk ? secureClient.connect(ip, 443) : secureClient.connect(host.c_str(), 443);
-    if (connected) {
-      secureClientHost = host;
-      escritos = secureClient.print(request);
-    }
-  }
-
-  if (!connected || escritos == 0) {
-    secureClient.stop();
-    secureClientHost = "";
-    respostaOut = "";
-    return -1;
-  }
-
-  unsigned long esperaResposta = reaproveitada ? STALE_WAIT_MS : HTTP_TIMEOUT_MS;
-  unsigned long limite = millis() + esperaResposta;
-  while (!secureClient.available() && secureClient.connected() && millis() < limite) {
+  unsigned long inicio = millis();
+  while (!secureClient.available() && secureClient.connected() && millis() - inicio < esperaMs) {
     delay(1);
   }
-
-  if (reaproveitada && !secureClient.available()) {
-    // conexao reaproveitada nao respondeu a tempo (provavelmente fechada em silencio
-    // pelo proxy do servidor) — descarta e refaz com conexao nova, 1x
-    secureClient.stop();
-    connected = dnsOk ? secureClient.connect(ip, 443, HTTP_TIMEOUT_MS) : secureClient.connect(host.c_str(), 443, HTTP_TIMEOUT_MS);
-    if (connected) {
-      secureClientHost = host;
-      escritos = secureClient.print(request);
-
-      unsigned long limite2 = millis() + HTTP_TIMEOUT_MS;
-      while (!secureClient.available() && secureClient.connected() && millis() < limite2) {
-        delay(1);
-      }
-    }
-
-    if (!connected || escritos == 0) {
-      secureClient.stop();
-      secureClientHost = "";
-      respostaOut = "";
-      return -1;
-    }
-  }
+  if (!secureClient.available()) { fecharConexao(); return -1; }
 
   String headers = "";
   bool headersCompletos = false;
-  unsigned long limiteHeaders = millis() + HTTP_TIMEOUT_MS;
-  while (!headersCompletos && millis() < limiteHeaders) {
+  inicio = millis();
+  while (!headersCompletos && millis() - inicio < HTTP_TIMEOUT_MS) {
     while (secureClient.available()) {
       headers += (char)secureClient.read();
       if (headers.endsWith("\r\n\r\n")) { headersCompletos = true; break; }
     }
     if (!headersCompletos && !secureClient.connected() && !secureClient.available()) break;
+    if (!headersCompletos) delay(1);
   }
-
-  int contentLength = extrairContentLength(headers);
-  bool chunked = headers.indexOf("Transfer-Encoding: chunked") >= 0 ||
-                 headers.indexOf("transfer-encoding: chunked") >= 0;
-  bool fechaConexao = respostaFechaConexao(headers) || chunked || contentLength < 0;
-
-  String corpo = "";
-  if (!fechaConexao) {
-    unsigned long limiteBody = millis() + HTTP_TIMEOUT_MS;
-    while ((int)corpo.length() < contentLength && millis() < limiteBody) {
-      while (secureClient.available() && (int)corpo.length() < contentLength) {
-        corpo += (char)secureClient.read();
-      }
-      if (!secureClient.connected() && !secureClient.available() && (int)corpo.length() < contentLength) break;
-    }
-  } else {
-    unsigned long limiteFechamento = millis() + HTTP_TIMEOUT_MS;
-    while ((secureClient.connected() || secureClient.available()) && millis() < limiteFechamento) {
-      while (secureClient.available()) corpo += (char)secureClient.read();
-      if (!secureClient.connected() && !secureClient.available()) break;
-    }
-    if (millis() >= limiteFechamento) {
-      secureClient.stop();
-      secureClientHost = "";
-    }
-  }
-
-  if (fechaConexao) {
-    secureClient.stop();
-    secureClientHost = "";
-  }
-
-  if (secureClient.connected()) secureClientLastUse = millis();
 
   int code = 0;
   int sp1 = headers.indexOf(' ');
@@ -230,8 +156,123 @@ int fazerRequisicao(String url, String jsonBody, String &respostaOut) {
     code = headers.substring(sp1 + 1, sp2).toInt();
   }
 
-  respostaOut = corpo;
+  int contentLength = extrairContentLength(headers);
+  bool chunked = headers.indexOf("Transfer-Encoding: chunked") >= 0 ||
+                 headers.indexOf("transfer-encoding: chunked") >= 0;
+
+  // so mantem a conexao se a resposta terminou de forma bem delimitada
+  bool completo = headersCompletos;
+  if (completo && !semCorpo) {
+    inicio = millis();
+    if (contentLength >= 0) {
+      while ((int)corpo.length() < contentLength && millis() - inicio < HTTP_TIMEOUT_MS) {
+        while (secureClient.available() && (int)corpo.length() < contentLength) corpo += (char)secureClient.read();
+        if (!secureClient.connected() && !secureClient.available()) break;
+        if ((int)corpo.length() < contentLength) delay(1);
+      }
+      completo = (int)corpo.length() >= contentLength;
+    } else if (chunked) {
+      // antes esperava o servidor fechar (que nunca fecha em keep-alive) = 3s perdidos
+      while (!corpo.endsWith("0\r\n\r\n") && millis() - inicio < HTTP_TIMEOUT_MS) {
+        while (secureClient.available()) corpo += (char)secureClient.read();
+        if (!secureClient.connected() && !secureClient.available()) break;
+        if (!corpo.endsWith("0\r\n\r\n")) delay(1);
+      }
+      completo = corpo.endsWith("0\r\n\r\n");
+    } else {
+      while ((secureClient.connected() || secureClient.available()) && millis() - inicio < HTTP_TIMEOUT_MS) {
+        while (secureClient.available()) corpo += (char)secureClient.read();
+        delay(1);
+      }
+      completo = false;
+    }
+  }
+
+  if (!completo || respostaFechaConexao(headers)) fecharConexao();
+  else secureClientLastUse = millis();
+
   return code;
+}
+
+int fazerRequisicao(String metodo, String url, String jsonBody, String &respostaOut) {
+  String host, path;
+  parseUrl(url, host, path);
+
+  if (!secureClientPronto) {
+    secureClient.setInsecure();
+    secureClient.setTimeout(CONNECT_TIMEOUT_S);          // em segundos
+    secureClient.setHandshakeTimeout(CONNECT_TIMEOUT_S); // em segundos (antes recebia 3000 = 50 min travado)
+    secureClientPronto = true;
+  }
+
+  bool reaproveitada = secureClient.connected() && secureClientHost == host &&
+                        (millis() - secureClientLastUse < MAX_REUSE_IDLE_MS);
+  unsigned long t0 = millis();
+  if (!reaproveitada && !abrirConexao(host)) {
+    Serial.printf("[%s] falha ao conectar apos %lu ms\n", metodo.c_str(), millis() - t0);
+    if (metodo != "HEAD") ultimaConexao = "falha";
+    respostaOut = "";
+    return -1;
+  }
+  unsigned long tConexao = millis() - t0;
+
+  String request = metodo + " " + path + " HTTP/1.1\r\n";
+  request += "Host: " + host + "\r\n";
+  if (jsonBody.length() > 0) {
+    request += "Content-Type: application/json\r\n";
+    request += "Content-Length: " + String(jsonBody.length()) + "\r\n";
+  }
+  request += "Connection: keep-alive\r\n\r\n";
+  request += jsonBody;
+
+  bool semCorpo = (metodo == "HEAD");
+  unsigned long t1 = millis();
+  int code = transacao(request, semCorpo, reaproveitada ? STALE_WAIT_MS : HTTP_TIMEOUT_MS, respostaOut);
+  unsigned long tResposta = millis() - t1;
+
+  bool refeita = false;
+  if (code < 0 && reaproveitada) {
+    // conexao reaproveitada tinha sido fechada em silencio pelo servidor — refaz 1x
+    refeita = true;
+    t0 = millis();
+    if (!abrirConexao(host)) {
+      if (!semCorpo) ultimaConexao = "falha";
+      respostaOut = "";
+      return -1;
+    }
+    tConexao = millis() - t0;
+    t1 = millis();
+    code = transacao(request, semCorpo, HTTP_TIMEOUT_MS, respostaOut);
+    tResposta = millis() - t1;
+  }
+
+  if (!semCorpo) ultimaConexao = refeita ? "morta" : (reaproveitada ? "reap" : "nova");
+
+  // HEAD = ping de manutencao; so loga se algo der errado pra nao poluir o Serial
+  if (!semCorpo || code <= 0) {
+    Serial.printf("[%s %s] conexao: %s %lu ms | resposta: %lu ms | HTTP %d\n",
+                  metodo.c_str(), path.c_str(),
+                  refeita ? "MORTA, refeita" : (reaproveitada ? "reaproveitada" : "nova"),
+                  tConexao, tResposta, code);
+  }
+  return code;
+}
+
+int fazerRequisicao(String url, String jsonBody, String &respostaOut) {
+  return fazerRequisicao("POST", url, jsonBody, respostaOut);
+}
+
+// mantem a conexao TLS aberta enquanto a catraca esta parada,
+// pra leitura do cartao nao pagar DNS + handshake (~1-2s no ESP32)
+void manterConexaoAquecida() {
+  static unsigned long proximoPing = 0;
+  if ((long)(millis() - proximoPing) < 0) return;
+  if (secureClient.connected() && millis() - secureClientLastUse < KEEPALIVE_MS) return;
+
+  String host, path, resp;
+  parseUrl(serverUrl, host, path);
+  int code = fazerRequisicao("HEAD", "https://" + host + "/", "", resp);
+  proximoPing = millis() + (code > 0 ? KEEPALIVE_MS : KEEPALIVE_FALHA_MS);
 }
 
 // tenta 1x, e se falhar/der timeout, tenta mais 1x antes de desistir
@@ -240,6 +281,7 @@ int fazerRequisicaoComRetry(String url, String jsonBody, String &respostaOut) {
   if (code <= 0) {
     Serial.println("Falha na comunicacao — tentando novamente...");
     code = fazerRequisicao(url, jsonBody, respostaOut);
+    if (code > 0) ultimaConexao = "2x"; // so funcionou na segunda tentativa
   }
   return code;
 }
@@ -273,6 +315,46 @@ ModoAdmin modoAdmin = ADMIN_OFF;
 String adminBuffer = "";
 
 unsigned long wifiCaiuEm = 0;
+const unsigned long WIFI_RECONEXAO_MS = 20000; // tempo que o driver tem pra reconectar sozinho antes de um begin() novo
+
+// ==========================
+// DIAGNOSTICO WIFI
+// ==========================
+volatile uint8_t wifiUltimoMotivo = 0;   // codigo de desconexao do driver (wifi_err_reason_t)
+volatile bool    wifiAssociado    = false; // ligado no roteador mas ainda sem IP
+
+void eventoWiFi(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      wifiAssociado = true;
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      wifiUltimoMotivo = 0;
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      wifiAssociado = false;
+      wifiUltimoMotivo = info.wifi_sta_disconnected.reason;
+      break;
+    default:
+      break;
+  }
+}
+
+// texto curto (cabe no LCD) explicando por que nao conectou
+String motivoWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return "Conectado";
+  if (wifiAssociado)                 return "Sem IP (DHCP)";
+  switch (wifiUltimoMotivo) {
+    case 0:   return "Conectando...";
+    case 201: return "Rede nao achada";   // NO_AP_FOUND: SSID errado, fora de alcance ou so 5GHz
+    case 15:
+    case 204: return "Senha errada?";     // 4WAY_HANDSHAKE_TIMEOUT / HANDSHAKE_TIMEOUT
+    case 202: return "Auth recusada";     // AUTH_FAIL: senha ou bloqueio por MAC
+    case 203: return "Assoc recusada";    // ASSOC_FAIL: roteador recusou (MAC/lotado)
+    case 200: return "Sinal fraco";       // BEACON_TIMEOUT
+    default:  return "Erro " + String(wifiUltimoMotivo);
+  }
+}
 
 // ==========================
 // TIMER LCD
@@ -379,7 +461,9 @@ void setup() {
   mfrc522.PCD_Init();
 
   mostrarLCD("Conectando", "WiFi...");
+  WiFi.onEvent(eventoWiFi);
   WiFi.mode(WIFI_STA);
+  Serial.println("MAC (pra liberar na rede): " + WiFi.macAddress());
   WiFi.setSleep(false);       // catraca fica na tomada — sem economia de energia, evita picos de latencia no radio
   WiFi.setAutoReconnect(true); // deixa o proprio driver do ESP32 reconectar assim que detecta a queda
   WiFi.disconnect();
@@ -387,17 +471,32 @@ void setup() {
   WiFi.begin(ssid, password);
 
   int tentativas = 0;
-  while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
+  while (WiFi.status() != WL_CONNECTED && tentativas < 40) {
     delay(500);
     Serial.print(".");
     tentativas++;
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    mostrarLCD("Sem WiFi!", "Verifique rede");
-    Serial.println("Falha no WiFi!");
+    String motivo = motivoWiFi();
+    Serial.println("Falha no WiFi: " + motivo + " (codigo " + String(wifiUltimoMotivo) + ")");
+
+    // procura a rede pra saber se o ESP ao menos enxerga ela (ESP32 so pega 2.4GHz)
+    int n = WiFi.scanNetworks();
+    int rssi = 0;
+    for (int i = 0; i < n; i++) {
+      if (WiFi.SSID(i) == ssid) { rssi = WiFi.RSSI(i); break; }
+    }
+    WiFi.scanDelete();
+    if (rssi == 0) Serial.printf("Rede \"%s\" NAO encontrada no scan (%d redes vistas)\n", ssid, n);
+    else           Serial.printf("Rede \"%s\" encontrada, sinal %d dBm\n", ssid, rssi);
+
+    mostrarLCD("Sem WiFi!", motivo);
+    delay(3000);
+    WiFi.begin(ssid, password); // o scan interrompe a tentativa; o loop continua daqui
+    wifiCaiuEm = millis();
   } else {
-    Serial.println("\nWiFi conectado!");
+    Serial.println("WiFi conectado! IP: " + WiFi.localIP().toString());
     mostrarLCD("WiFi OK!", WiFi.localIP().toString());
     delay(1500);
   }
@@ -421,24 +520,27 @@ void loop() {
   // 1. WIFI — reconexao ativa (nao depende so do
   //    auto-reconnect do driver, que as vezes nao volta)
   // ─────────────────────────────────────────────────
-  static unsigned long lastWifiTry = 0;
+  static bool estavaConectado = false;
+  if ((WiFi.status() == WL_CONNECTED) != estavaConectado) {
+    estavaConectado = !estavaConectado;
+    if (estavaConectado) Serial.println("WiFi conectado! IP: " + WiFi.localIP().toString());
+    else                 Serial.println("WiFi caiu: " + motivoWiFi());
+  }
+
+  // antes chamava reconnect() a cada 2s, o que interrompia a tentativa em
+  // andamento (auth + DHCP na rede do IF pode passar de 2s) e nunca conectava
   if (WiFi.status() != WL_CONNECTED) {
     if (wifiCaiuEm == 0) wifiCaiuEm = millis();
-    if (millis() - lastWifiTry > 2000) {
-      lastWifiTry = millis();
-      unsigned long caidoHa = millis() - wifiCaiuEm;
-      if (caidoHa < 8000) {
-        Serial.println("WiFi perdido — reconectando...");
-        WiFi.reconnect();
-      } else {
-        Serial.println("WiFi ainda caido — reconexao completa...");
-        WiFi.disconnect();
-        WiFi.begin(ssid, password);
-        wifiCaiuEm = millis(); // reinicia o ciclo: mais algumas tentativas leves antes do proximo begin()
-      }
+    if (millis() - wifiCaiuEm > WIFI_RECONEXAO_MS) {
+      Serial.printf("WiFi caido ha %lus (%s) — reconexao completa...\n",
+                    (millis() - wifiCaiuEm) / 1000, motivoWiFi().c_str());
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+      wifiCaiuEm = millis();
     }
   } else {
     wifiCaiuEm = 0;
+    if (estado == IDLE && !modoLivre) manterConexaoAquecida();
   }
 
   // ─────────────────────────────────────────────────
@@ -454,7 +556,7 @@ void loop() {
   char key = readKey();
 
   if (key != '\0') {
-    Serial.print("Tecla: "); Serial.println(key);
+    Serial.println(String("Tecla: ") + key);
 
     if (modoAdmin == ADMIN_SENHA) {
       // ---- digitando a senha pra entrar no menu admin ----
@@ -633,7 +735,7 @@ void loop() {
 // =====================================================
 void enviarUID(String uid) {
   if (WiFi.status() != WL_CONNECTED) {
-    mostrarLCD("Sem WiFi!", "Acesso negado");
+    mostrarLCD("Sem WiFi!", motivoWiFi());
     somNegado();
     agendarLcdIdle();
     return;
@@ -641,8 +743,11 @@ void enviarUID(String uid) {
 
   String body = "{\"uid\":\"" + uid + "\"}";
   String resp;
+  unsigned long t0 = millis();
   int code = fazerRequisicaoComRetry(serverUrl, body, resp);
+  ultimoTempoMs = millis() - t0;
 
+  Serial.printf("RFID: HTTP %d em %lu ms\n", code, ultimoTempoMs);
   Serial.println("Resp RFID: " + resp);
   processarResposta(code, resp);
 }
@@ -652,7 +757,7 @@ void enviarUID(String uid) {
 // =====================================================
 void enviarMatricula(String matricula) {
   if (WiFi.status() != WL_CONNECTED) {
-    mostrarLCD("Sem WiFi!", "Acesso negado");
+    mostrarLCD("Sem WiFi!", motivoWiFi());
     somNegado();
     agendarLcdIdle();
     return;
@@ -660,8 +765,11 @@ void enviarMatricula(String matricula) {
 
   String body = "{\"matricula\":\"" + matricula + "\"}";
   String resp;
+  unsigned long t0 = millis();
   int code = fazerRequisicaoComRetry(matriculaUrl, body, resp);
+  ultimoTempoMs = millis() - t0;
 
+  Serial.printf("Matricula: HTTP %d em %lu ms\n", code, ultimoTempoMs);
   Serial.println("Resp Matricula: " + resp);
   processarResposta(code, resp);
 }
@@ -669,16 +777,23 @@ void enviarMatricula(String matricula) {
 // =====================================================
 // PROCESSA RESPOSTA
 // =====================================================
+// linha do LCD com resultado + tempo + tipo de conexao, ex: "OK 185ms reap"
+String linhaTempo(String tag) {
+  String ms = ultimoTempoMs < 10000 ? String(ultimoTempoMs) + "ms" : String(ultimoTempoMs / 1000) + "s";
+  String s = tag + " " + ms + " " + ultimaConexao;
+  return s.substring(0, 16);
+}
+
 void processarResposta(int httpCode, String response) {
   if (httpCode <= 0) {
-    mostrarLCD("Erro servidor", "Acesso negado");
+    mostrarLCD("Erro servidor", MOSTRAR_TEMPO_LCD ? linhaTempo("ERRO") : "Acesso negado");
     somNegado();
     agendarLcdIdle();
     return;
   }
 
   if (response.indexOf("\"resultado\":\"leitura\"") >= 0) {
-    mostrarLCD("Modo cadastro", "UID capturado");
+    mostrarLCD("Modo cadastro", MOSTRAR_TEMPO_LCD ? linhaTempo("UID") : "UID capturado");
     somLeitura();
     agendarLcdIdle();
     return;
@@ -693,6 +808,7 @@ void processarResposta(int httpCode, String response) {
   if (response.indexOf("\"liberar\":true") >= 0) {
     String l1 = nome.length() > 0 ? nome : "Liberado!";
     String l2 = matricula.length() > 0 ? matricula : "";
+    if (MOSTRAR_TEMPO_LCD) l2 = linhaTempo("OK");
     mostrarLCD(l1, l2);
 
     somLiberado();
